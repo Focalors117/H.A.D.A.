@@ -1,0 +1,33 @@
+name: Prettier Check
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - "backend/**"
+
+jobs:
+  prettier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install frontend deps
+        run: |
+          cd frontend
+          npm ci
+      - name: Check frontend formatting
+        run: |
+          cd frontend
+          npm run format:check
+      - name: Install backend deps
+        run: |
+          cd backend
+          npm ci
+      - name: Check backend formatting
+        run: |
+          cd backend
+          npm run format:check

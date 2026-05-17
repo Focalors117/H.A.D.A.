@@ -7,11 +7,18 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "profile:frontend": "npm run build && echo \"Artifacts built — open browser devtools for profiling\"",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "lucide-react": "^0.516.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
+    "react-force-graph-2d": "^1.29.0",
     "react-hot-toast": "^2.6.0",
     "recharts": "^3.8.1"
   },
@@ -31,6 +38,13 @@
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.2",
     "typescript-eslint": "^8.58.2",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "vitest": "^4.1.6",
+    "prettier": "^2.8.8"
+  },
+  "prettier": {
+    "semi": true,
+    "singleQuote": true,
+    "printWidth": 100
   }
 }

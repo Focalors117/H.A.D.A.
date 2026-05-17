@@ -7,24 +7,40 @@
   "scripts": {
     "dev": "nodemon --exec tsx server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "test:unit": "node --test --import tsx tests/scanRateLimit.test.ts",
+    "test:scan": "node --test --import tsx tests/scan.integration.test.ts",
+    "test:health": "node --test --import tsx tests/health.integration.test.ts",
+    "test:integration": "node --test --import tsx tests/health.integration.test.ts tests/scan.integration.test.ts",
+    "migrate": "tsx migrations/001-create-assets.ts",
+    "profile:backend": "npm run build && node --prof ./dist/server.js",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/mongoose": "^5.11.97",
+    "@types/multicast-dns": "^7.2.4",
     "@types/node": "^20.11.0",
     "nodemon": "^3.1.0",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "prettier": "^2.8.8"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
     "mongoose": "^8.2.0",
+    "multicast-dns": "^7.2.5",
     "oui-data": "^1.1.571",
     "ping": "^1.0.0"
+  },
+  "prettier": {
+    "semi": true,
+    "singleQuote": true,
+    "printWidth": 100
   }
 }

@@ -1,73 +1,111 @@
-# React + TypeScript + Vite
+# H.A.D.A Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Interfaz de monitoreo y escaneo para la red H.A.D.A. El frontend vive en esta carpeta y consume el backend en `http://localhost:3001`.
 
-Currently, two official plugins are available:
+## Requisitos
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Node.js 18 o superior
+- Backend levantado en el puerto 3001
 
-## React Compiler
+## Instalación
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd frontend
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Scripts
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev
+npm run build
+npm run lint
+npm run test
+npm run preview
 ```
+
+## Arranque local
+
+1. Levanta el backend:
+
+```bash
+cd backend
+npm install
+npm run dev
+```
+
+2. Levanta el frontend:
+
+```bash
+cd frontend
+npm run dev
+```
+
+3. Abre `http://localhost:5173`.
+
+## API principal
+
+Base URL: `http://localhost:3001/api`
+
+| Método | Ruta                    | Descripción                      |
+| ------ | ----------------------- | -------------------------------- |
+| GET    | `/health`               | Estado general del backend       |
+| GET    | `/network/context`      | Contexto de red activo detectado |
+| GET    | `/assets?networkId=...` | Lista los activos del workspace  |
+| POST   | `/assets`               | Crea un activo                   |
+| PUT    | `/assets/:id`           | Actualiza estado o criticidad    |
+| DELETE | `/assets/:id`           | Elimina un activo                |
+| DELETE | `/workspaces/:id`       | Borra un workspace y sus activos |
+| GET    | `/events?networkId=...` | Eventos de seguridad recientes   |
+| POST   | `/radar/control`        | Activa o pausa el radar          |
+| POST   | `/scan`                 | Ejecuta un escaneo controlado    |
+
+## Ejemplos cURL
+
+### Salud
+
+```bash
+curl http://localhost:3001/api/health
+```
+
+### Contexto de red
+
+```bash
+curl http://localhost:3001/api/network/context
+```
+
+### Listar activos
+
+```bash
+curl "http://localhost:3001/api/assets?networkId=default"
+```
+
+### Crear activo
+
+```bash
+curl -X POST http://localhost:3001/api/assets ^
+  -H "Content-Type: application/json" ^
+  -d "{\"hostname\":\"LAB-PC\",\"ip\":\"192.168.1.50\",\"mac\":\"AA:BB:CC:DD:EE:FF\",\"os\":\"Windows\",\"criticality\":5,\"status\":\"Active\",\"networkId\":\"default\"}"
+```
+
+### Ejecutar scan
+
+```bash
+curl -X POST http://localhost:3001/api/scan ^
+  -H "Content-Type: application/json" ^
+  -d "{\"ip\":\"192.168.1.50\",\"mode\":\"normal\"}"
+```
+
+### Pausar radar
+
+```bash
+curl -X POST http://localhost:3001/api/radar/control ^
+  -H "Content-Type: application/json" ^
+  -d "{\"active\":false}"
+```
+
+## Notas
+
+- El escaneo solo acepta IPs privadas.
+- El endpoint `/scan` aplica rate limiting in-memory para evitar abuso.
+- Si Mongo no está disponible, el backend sigue funcionando con caché en memoria.
