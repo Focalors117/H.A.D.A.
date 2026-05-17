@@ -282,6 +282,16 @@ const pushSecurityEvent = (event: Omit<(typeof securityEvents)[number], 'id' | '
   if (securityEvents.length > 100) securityEvents.length = 100;
 };
 
+// Feedback receipts (in-memory; lightweight)
+const feedbacks: Array<{ id: string; email?: string; message: string; ts: string }> = [];
+
+const pushFeedback = (payload: { email?: string; message: string }) => {
+  const entry = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, ...payload, ts: new Date().toISOString() };
+  feedbacks.unshift(entry);
+  if (feedbacks.length > 200) feedbacks.length = 200;
+  return entry;
+};
+
 const registerKnownMac = (networkId: string, mac: string) => {
   const normalized = mac.toUpperCase();
   if (!knownMacPerNetwork.has(networkId)) knownMacPerNetwork.set(networkId, new Set());
@@ -772,6 +782,55 @@ app.delete('/api/workspaces/:id', async (req, res) => {
   } catch (error) {
     console.error('❌ Error al eliminar workspace:', error);
     return res.status(500).json({ message: 'Error interno' });
+  }
+});
+
+// Quick action: isolate an asset (simulated)
+app.post('/api/assets/:id/isolate', async (req, res) => {
+  try {
+    const assetId = String(req.params.id || '');
+    const asset = cachedAssets.find((a) => String(a._id) === assetId);
+    pushSecurityEvent({
+      type: 'NEW_UNKNOWN_DEVICE',
+      networkId: asset?.networkId ?? 'unknown',
+      ip: asset?.ip ?? '0.0.0.0',
+      mac: asset?.mac ?? '00:00:00:00:00:00',
+      message: `Aislamiento remoto solicitado para ${assetId}`,
+    });
+    // Simulate action accepted
+    res.status(200).json({ status: 'accepted', action: 'isolate', assetId });
+  } catch (e) {
+    res.status(500).json({ message: 'Error al procesar aislamiento' });
+  }
+});
+
+// Quick action: block IP via firewall (simulated)
+app.post('/api/firewall/block', async (req, res) => {
+  try {
+    const ip = String(req.body?.ip || '');
+    if (!ip) return res.status(400).json({ message: 'IP requerida' });
+    pushSecurityEvent({
+      type: 'DOUBLE_AGENT',
+      networkId: 'operator',
+      ip,
+      mac: '00:00:00:00:00:00',
+      message: `Solicitud de bloqueo de IP ${ip}`,
+    });
+    res.status(202).json({ status: 'queued', ip });
+  } catch {
+    res.status(500).json({ message: 'Error al encolar bloqueo' });
+  }
+});
+
+// Feedback endpoint (stores in-memory and returns receipt id)
+app.post('/api/feedback', async (req, res) => {
+  try {
+    const { email, message } = req.body ?? {};
+    if (!message || String(message).trim().length === 0) return res.status(400).json({ message: 'Mensaje requerido' });
+    const entry = pushFeedback({ email: String(email || ''), message: String(message) });
+    res.status(201).json({ received: true, id: entry.id });
+  } catch (e) {
+    res.status(500).json({ message: 'Error interno' });
   }
 });
 

@@ -40,6 +40,8 @@
     "typescript-eslint": "^8.58.2",
     "vite": "^8.0.10",
     "vitest": "^4.1.6",
+    "@playwright/test": "^1.43.0",
+    "playwright": "^1.43.0",
     "prettier": "^2.8.8"
   },
   "prettier": {

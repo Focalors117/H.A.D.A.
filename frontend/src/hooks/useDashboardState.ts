@@ -71,8 +71,10 @@ export default function useDashboardState() {
       setTelemetryEnabled(workspaceSettings.telemetryEnabled);
     if (typeof workspaceSettings.animationsEnabled === 'boolean')
       setAnimationsEnabled(workspaceSettings.animationsEnabled);
-    if (typeof workspaceSettings.ttlSeconds === 'number') setTtlSeconds(workspaceSettings.ttlSeconds);
-    if (typeof workspaceSettings.radarActive === 'boolean') setRadarActive(workspaceSettings.radarActive);
+    if (typeof workspaceSettings.ttlSeconds === 'number')
+      setTtlSeconds(workspaceSettings.ttlSeconds);
+    if (typeof workspaceSettings.radarActive === 'boolean')
+      setRadarActive(workspaceSettings.radarActive);
     if (typeof workspaceSettings.panLocked === 'boolean') setPanLocked(workspaceSettings.panLocked);
   }, [activeWorkspaceId]);
   const [query, setQuery] = useState('');
