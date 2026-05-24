@@ -2,7 +2,7 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { exec, execSync } from 'child_process';
+import { exec } from 'child_process';
 import http from 'http';
 import https from 'https';
 import mdns from 'multicast-dns';
@@ -10,9 +10,11 @@ import mongoose from 'mongoose';
 import net from 'net';
 import os from 'os';
 import ping from 'ping';
-import ouiData from 'oui-data' assert { type: 'json' };
+import ouiData from 'oui-data' with { type: 'json' };
 import { pathToFileURL } from 'url';
 import { Asset } from './models/Asset.js';
+import { Scan } from './models/Scan.js';
+import { Service } from './models/Service.js';
 import { createScanRateLimiter } from './utils/scanRateLimit.js';
 
 // --- CONFIGURACIÓN ---
@@ -55,10 +57,27 @@ const PORT = Number(process.env.PORT || 3001);
 const MONGO_URI = process.env.MONGO_URI || '';
 const PORTS_TO_SCAN = [21, 22, 23, 80, 443, 445, 3306, 3389, 8080];
 const scanRateLimiter = createScanRateLimiter({ windowMs: 60_000, max: 3 });
+const WIFI_SSID_CACHE_TTL_MS = 30_000;
 
 // --- ESTADO DE RUNTIME ---
 let isRadarEnabled = true;
-let cachedAssets: any[] = [];
+type CachedAsset = {
+  _id: string;
+  hostname: string;
+  mac: string;
+  os: string;
+  vendor: string;
+  criticality: number;
+  networkId: string;
+  ip: string;
+  detectionSource: 'ARP' | 'TTL' | 'MANUAL';
+  status: 'Active' | 'Down' | 'Compromised';
+  lastScanAt?: Date;
+  lastScanMode?: 'normal' | 'stealth';
+  services: ServiceScan[];
+};
+
+let cachedAssets: CachedAsset[] = [];
 const localDeviceNames: Record<string, string> = {};
 const knownMacPerNetwork = new Map<string, Set<string>>();
 const securityEvents: Array<{
@@ -70,6 +89,23 @@ const securityEvents: Array<{
   message: string;
   timestamp: string;
 }> = [];
+
+// Runtime controls to allow pausing the radar fully
+const radarIntervals: { scan?: NodeJS.Timeout; discover?: NodeJS.Timeout } = {};
+const activeScannerSockets = new Set<net.Socket>();
+
+const destroyActiveSockets = () => {
+  for (const s of Array.from(activeScannerSockets)) {
+    try {
+      s.destroy();
+    } catch {
+      // ignore
+    }
+    activeScannerSockets.delete(s);
+  }
+};
+
+let wifiSsidCache: { value: string | null; expiresAt: number } | null = null;
 
 type ScanRisk = {
   port: number;
@@ -162,22 +198,35 @@ const isBroadcastOrInvalidTarget = (ip: string) => {
   return false;
 };
 
-const getWifiSsid = () => {
+const getWifiSsid = async () => {
+  const now = Date.now();
+  if (wifiSsidCache && wifiSsidCache.expiresAt > now) {
+    return wifiSsidCache.value;
+  }
+
   try {
-    const output = execSync('netsh wlan show interfaces', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 3000,
+    const output = await new Promise<string>((resolve, reject) => {
+      exec('netsh wlan show interfaces', { encoding: 'utf8', timeout: 3000 }, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(stdout);
+      });
     });
     const match = output.match(/^\s*SSID\s*:\s*(.+)$/m);
     const ssid = match?.[1]?.trim();
-    return ssid && ssid !== '' ? ssid : null;
+    const value = ssid && ssid !== '' ? ssid : null;
+    wifiSsidCache = { value, expiresAt: now + WIFI_SSID_CACHE_TTL_MS };
+    return value;
   } catch {
+    wifiSsidCache = { value: null, expiresAt: now + 5_000 };
     return null;
   }
 };
 
-const getNetworkContext = () => {
+const getNetworkContext = async () => {
   const interfaces = os.networkInterfaces();
   const networks: Array<{
     iface: string;
@@ -185,7 +234,7 @@ const getNetworkContext = () => {
     networkId: string;
     label: string;
   }> = [];
-  const wifiSsid = getWifiSsid();
+  const wifiSsid = await getWifiSsid();
 
   for (const ifaceName of Object.keys(interfaces)) {
     for (const iface of interfaces[ifaceName] ?? []) {
@@ -239,9 +288,78 @@ const withDbCache = async <T>(operation: () => Promise<T>, fallback: T): Promise
 
 const isMongoReady = () => mongoose.connection.readyState === 1;
 
-const upsertCachedAsset = (asset: any) => {
+const toObjectId = (value: string) => new mongoose.Types.ObjectId(value);
+
+const mergeAssetsFromDb = async (networkId?: string): Promise<CachedAsset[]> => {
+  const assetFilter = networkId ? { networkId } : {};
+  const scanFilter = networkId ? { networkId } : {};
+  const serviceFilter = networkId ? { networkId } : {};
+
+  const assets = await Asset.find(assetFilter).lean();
+  if (assets.length === 0) return [];
+
+  const assetIds = assets.map((asset) => asset._id);
+  const scans = await Scan.find({ ...scanFilter, assetId: { $in: assetIds } })
+    .sort({ lastScanAt: -1, createdAt: -1 })
+    .lean();
+  const services = await Service.find({ ...serviceFilter, assetId: { $in: assetIds } }).lean();
+
+  const latestScanByAsset = new Map<string, (typeof scans)[number]>();
+  for (const scan of scans) {
+    const key = String(scan.assetId);
+    if (!latestScanByAsset.has(key)) latestScanByAsset.set(key, scan);
+  }
+
+  const servicesByAsset = new Map<string, ServiceScan[]>();
+  for (const service of services) {
+    const key = String(service.assetId);
+    if (!servicesByAsset.has(key)) servicesByAsset.set(key, []);
+    servicesByAsset.get(key)?.push({
+      port: service.port,
+      banner: service.banner || '',
+      fingerprint: service.fingerprint || '',
+    });
+  }
+
+  return assets.map((asset) => {
+    const key = String(asset._id);
+    const latestScan = latestScanByAsset.get(key);
+
+    return {
+      _id: key,
+      hostname: String(asset.hostname || 'UNKNOWN'),
+      mac: String(asset.mac || '00:00:00:00:00:00'),
+      os: String(asset.os || 'Desconocido'),
+      vendor: String(asset.vendor || 'Generico'),
+      criticality: Number(asset.criticality || 5),
+      networkId: asset.networkId || 'default',
+      ip: latestScan?.ip || '',
+      detectionSource: (latestScan?.detectionSource || 'MANUAL') as 'ARP' | 'TTL' | 'MANUAL',
+      status: (latestScan?.status || 'Down') as 'Active' | 'Down' | 'Compromised',
+      lastScanAt: latestScan?.lastScanAt,
+      lastScanMode: latestScan?.lastScanMode as 'normal' | 'stealth' | undefined,
+      services: servicesByAsset.get(key) || [],
+    };
+  });
+};
+
+const upsertCachedAsset = (asset: Record<string, any>): CachedAsset => {
   const assetId = String(asset._id ?? `${asset.ip}-${asset.networkId}`);
-  const nextAsset = { ...asset, _id: assetId };
+  const nextAsset: CachedAsset = {
+    _id: assetId,
+    hostname: String(asset.hostname || 'UNKNOWN'),
+    mac: String(asset.mac || '00:00:00:00:00:00'),
+    os: String(asset.os || 'Desconocido'),
+    vendor: String(asset.vendor || 'Generico'),
+    criticality: Number(asset.criticality || 5),
+    networkId: String(asset.networkId || 'default'),
+    ip: String(asset.ip || ''),
+    detectionSource: (asset.detectionSource || 'MANUAL') as 'ARP' | 'TTL' | 'MANUAL',
+    status: (asset.status || 'Active') as 'Active' | 'Down' | 'Compromised',
+    lastScanAt: asset.lastScanAt,
+    lastScanMode: asset.lastScanMode,
+    services: Array.isArray(asset.services) ? asset.services : [],
+  };
   const index = cachedAssets.findIndex((item) => String(item._id) === assetId);
 
   if (index >= 0) {
@@ -269,8 +387,84 @@ const deleteCachedAsset = (assetId: string) => {
 
 const refreshCache = async () => {
   if (!isMongoReady()) return cachedAssets;
-  cachedAssets = await withDbCache(() => Asset.find().lean(), cachedAssets);
+  cachedAssets = await withDbCache(() => mergeAssetsFromDb(), cachedAssets);
   return cachedAssets;
+};
+
+const createScanSnapshot = async (payload: {
+  assetId: string;
+  networkId: string;
+  ip: string;
+  detectionSource: 'ARP' | 'TTL' | 'MANUAL';
+  status: 'Active' | 'Down' | 'Compromised';
+  mode?: 'normal' | 'stealth';
+  scannedAt?: Date;
+}) => {
+  const scan = new Scan({
+    assetId: toObjectId(payload.assetId),
+    networkId: payload.networkId,
+    ip: payload.ip,
+    detectionSource: payload.detectionSource,
+    status: payload.status,
+    lastScanAt: payload.scannedAt || new Date(),
+    lastScanMode: payload.mode,
+  });
+  await scan.save();
+  return scan;
+};
+
+const updateLatestScanState = async (payload: {
+  assetId: string;
+  networkId: string;
+  status: 'Active' | 'Down' | 'Compromised';
+  ip?: string;
+  detectionSource?: 'ARP' | 'TTL' | 'MANUAL';
+  mode?: 'normal' | 'stealth';
+}) => {
+  const latest = await Scan.findOne({ assetId: toObjectId(payload.assetId) }).sort({
+    lastScanAt: -1,
+    createdAt: -1,
+  });
+
+  if (!latest) {
+    if (!payload.ip) return null;
+    return createScanSnapshot({
+      assetId: payload.assetId,
+      networkId: payload.networkId,
+      ip: payload.ip,
+      detectionSource: payload.detectionSource || 'MANUAL',
+      status: payload.status,
+      mode: payload.mode,
+      scannedAt: new Date(),
+    });
+  }
+
+  latest.status = payload.status;
+  if (payload.ip) latest.ip = payload.ip;
+  if (payload.detectionSource) latest.detectionSource = payload.detectionSource;
+  if (payload.mode) latest.lastScanMode = payload.mode;
+  latest.lastScanAt = new Date();
+  await latest.save();
+  return latest;
+};
+
+const replaceAssetServices = async (payload: {
+  assetId: string;
+  networkId: string;
+  services: ServiceScan[];
+}) => {
+  await Service.deleteMany({ assetId: toObjectId(payload.assetId) });
+  if (payload.services.length === 0) return;
+
+  await Service.insertMany(
+    payload.services.map((service) => ({
+      assetId: toObjectId(payload.assetId),
+      networkId: payload.networkId,
+      port: service.port,
+      banner: service.banner,
+      fingerprint: service.fingerprint,
+    }))
+  );
 };
 
 const pushSecurityEvent = (event: Omit<(typeof securityEvents)[number], 'id' | 'timestamp'>) => {
@@ -286,7 +480,11 @@ const pushSecurityEvent = (event: Omit<(typeof securityEvents)[number], 'id' | '
 const feedbacks: Array<{ id: string; email?: string; message: string; ts: string }> = [];
 
 const pushFeedback = (payload: { email?: string; message: string }) => {
-  const entry = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, ...payload, ts: new Date().toISOString() };
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    ...payload,
+    ts: new Date().toISOString(),
+  };
   feedbacks.unshift(entry);
   if (feedbacks.length > 200) feedbacks.length = 200;
   return entry;
@@ -410,6 +608,16 @@ const computeCvssLikeScore = (ports: number[], risks: ScanRisk[]) => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Safe ping wrapper: catches spawn/child_process errors (Windows) and returns a safe probe result
+const safeProbe = async (host: string, options: any = {}): Promise<any> => {
+  try {
+    return await ping.promise.probe(host, options);
+  } catch (err: any) {
+    console.warn(`⚠️ [ping] probe failed for ${host}:`, err?.code ?? err?.message ?? err);
+    return { alive: false, output: '', host };
+  }
+};
+
 // --- MIDDLEWARE DE SEGURIDAD PARA SCAN ---
 const validateScanTarget = (req: Request, res: Response, next: NextFunction) => {
   const targetIp = String(req.body?.ip || '').trim();
@@ -429,6 +637,7 @@ const validateScanTarget = (req: Request, res: Response, next: NextFunction) => 
 
 const mdnsSniffer = mdns();
 mdnsSniffer.on('response', (response) => {
+  if (!isRadarEnabled) return;
   response.answers.forEach((answer) => {
     if (answer.type !== 'A' && answer.type !== 'PTR') return;
     const name = answer.name.replace(/\.local\.?$/, '');
@@ -446,25 +655,47 @@ const registerLocalHost = async () => {
       if (iface.family !== 'IPv4' || iface.internal) continue;
       const base = iface.address.split('.').slice(0, 3).join('.');
       const networkId = `${base}.0/24`;
-      const exists = await withDbCache(() => Asset.findOne({ ip: iface.address, networkId }), null);
+      const exists = await withDbCache(
+        () =>
+          Scan.findOne({
+            ip: iface.address,
+            networkId,
+          }).lean(),
+        null
+      );
       if (exists) continue;
 
       const isVirtual =
         ifaceName.toLowerCase().includes('virtual') || iface.address.startsWith('192.168.56');
       const localDevice = new Asset({
         hostname: `${os.hostname().toUpperCase()} (${isVirtual ? 'VIRTUAL' : 'HOST'})`,
-        ip: iface.address,
         mac: iface.mac.toUpperCase().replace(/-/g, ':'),
         os: isVirtual ? 'Virtual Network Adapter' : 'Windows (Local Host)',
-        status: 'Active',
+        vendor: isVirtual ? 'Virtual Adapter' : 'Local Host',
+        criticality: 5,
         networkId,
       });
 
       await withDbCache(async () => {
         await localDevice.save();
+        await createScanSnapshot({
+          assetId: String(localDevice._id),
+          networkId,
+          ip: iface.address,
+          detectionSource: 'MANUAL',
+          status: 'Active',
+          scannedAt: new Date(),
+        });
         return true;
       }, false);
-      upsertCachedAsset(localDevice.toObject());
+      upsertCachedAsset({
+        ...localDevice.toObject(),
+        _id: String(localDevice._id),
+        ip: iface.address,
+        detectionSource: 'MANUAL',
+        status: 'Active',
+        services: [],
+      });
       registerKnownMac(networkId, localDevice.mac || '');
     }
   }
@@ -477,15 +708,17 @@ const scanNetwork = async () => {
   console.log(
     `[Sensor] scanNetwork -> Iniciando escaneo de activos en base de datos. Cantidad: ${cachedAssets.length}`
   );
-  const assets = isMongoReady()
-    ? await withDbCache(() => Asset.find(), cachedAssets)
-    : cachedAssets;
+  const assets = cachedAssets;
 
   let activeCount = 0;
   let downCount = 0;
 
   for (const asset of assets) {
-    const pingResult = await ping.promise.probe(asset.ip, { timeout: 2 });
+    if (!isRadarEnabled) {
+      console.log('[RADAR] Escaneo abortado por pausa.');
+      break;
+    }
+    const pingResult = await safeProbe(asset.ip, { timeout: 2 });
     let nextStatus: 'Active' | 'Down' | 'Compromised' = asset.status;
     let detectedOS = asset.os;
 
@@ -508,11 +741,24 @@ const scanNetwork = async () => {
       console.log(
         `[Sensor] Actualizado estado/OS para ${asset.ip} -> Estado: ${nextStatus}, OS: ${detectedOS}`
       );
-      await withDbCache(
-        () =>
-          Asset.findByIdAndUpdate(asset._id, { status: nextStatus, os: detectedOS }, { new: true }),
-        null
-      );
+      if (isMongoReady()) {
+        await withDbCache(async () => {
+          await Asset.findByIdAndUpdate(asset._id, { os: detectedOS }, { new: true });
+          await updateLatestScanState({
+            assetId: String(asset._id),
+            networkId: asset.networkId || 'default',
+            status: nextStatus,
+            ip: asset.ip,
+            detectionSource: 'TTL',
+          });
+          return true;
+        }, false);
+      } else {
+        updateCachedAsset(String(asset._id), {
+          status: nextStatus,
+          os: detectedOS,
+        });
+      }
     }
   }
 
@@ -522,7 +768,7 @@ const scanNetwork = async () => {
 
 const activeNetworkSweep = async () => {
   if (!isRadarEnabled) return;
-  const { networks } = getNetworkContext();
+  const { networks } = await getNetworkContext();
   console.log(
     `[Sensor] activeNetworkSweep -> Haciendo sweep de rangos: ${networks
       .map((n) => n.networkId)
@@ -530,16 +776,37 @@ const activeNetworkSweep = async () => {
   );
   const probes: Array<Promise<unknown>> = [];
 
+  const batchSize = 50; // limitar concurrencia para evitar spawn masivo
+  const inFlight: Promise<unknown>[] = [];
   for (const network of networks) {
     const base = network.ip.split('.').slice(0, 3).join('.');
     for (let host = 1; host <= 254; host += 1) {
+      if (!isRadarEnabled) {
+        inFlight.length = 0;
+        console.log('[RADAR] Barrido abortado por pausa.');
+        return;
+      }
       // Incrementar timeout a 1s para redes WiFi o físicas reales
-      probes.push(ping.promise.probe(`${base}.${host}`, { timeout: 1 }));
+      inFlight.push(safeProbe(`${base}.${host}`, { timeout: 1 }));
+      if (inFlight.length >= batchSize) {
+        try {
+          await Promise.all(inFlight);
+        } catch (e) {
+          /* safeProbe already catches errors */
+        }
+        inFlight.length = 0;
+      }
     }
   }
 
-  await Promise.all(probes);
-  console.log('🏁 [Radar] Active Sweep finalizado. Se enviaron pings a todos los hosts posibles.');
+  if (inFlight.length > 0) {
+    try {
+      await Promise.all(inFlight);
+    } catch (e) {
+      /* safeProbe already catches errors */
+    }
+  }
+  console.log('[RADAR] Barrido activo finalizado. Se enviaron pings a todos los hosts posibles.');
 };
 
 const resolveHostname = async (ip: string) => {
@@ -554,14 +821,15 @@ const resolveHostname = async (ip: string) => {
 
 const autoDiscoverDevices = async () => {
   if (!isRadarEnabled) {
-    console.log('⏸️ [Radar] Pausado, saltando auto-descubrimiento...');
+    console.log('[RADAR] Pausado, saltando auto-descubrimiento...');
     return;
   }
-  console.log('🔍 [Radar] Iniciando Active Sweep (ICMP/Ping)...');
+  console.log('[RADAR] Iniciando barrido activo (ICMP/Ping)...');
   await activeNetworkSweep();
 
-  console.log('📡 [Radar] Inspeccionando tabla ARP local...');
+  console.log('[RADAR] Inspeccionando tabla ARP local...');
   exec('arp -a', async (error, stdout) => {
+    if (!isRadarEnabled) return;
     if (error) return;
 
     const lines = stdout.split('\n');
@@ -575,7 +843,7 @@ const autoDiscoverDevices = async () => {
 
       const base = ip.split('.').slice(0, 3).join('.');
       const networkId = `${base}.0/24`;
-      const exists = await withDbCache(() => Asset.findOne({ ip, networkId }), null);
+      const exists = await withDbCache(() => Scan.findOne({ ip, networkId }).lean(), null);
       if (exists) continue;
 
       const hostname = await resolveHostname(ip);
@@ -585,20 +853,33 @@ const autoDiscoverDevices = async () => {
 
       const newDevice = new Asset({
         hostname,
-        ip,
         mac,
         os: 'Detecting...',
         vendor,
-        status: 'Active',
-        detectionSource: 'ARP',
+        criticality: 5,
         networkId,
       });
 
       await withDbCache(async () => {
         await newDevice.save();
+        await createScanSnapshot({
+          assetId: String(newDevice._id),
+          networkId,
+          ip,
+          detectionSource: 'ARP',
+          status: 'Active',
+          scannedAt: new Date(),
+        });
         return true;
       }, false);
-      upsertCachedAsset(newDevice.toObject());
+      upsertCachedAsset({
+        ...newDevice.toObject(),
+        _id: String(newDevice._id),
+        ip,
+        detectionSource: 'ARP',
+        status: 'Active',
+        services: [],
+      });
 
       const knownMacs = knownMacPerNetwork.get(networkId) ?? new Set<string>();
       if (!knownMacs.has(mac)) {
@@ -618,14 +899,14 @@ const autoDiscoverDevices = async () => {
       detectDoubleAgent(networkId, mac, ip);
     }
 
-    console.log('✅ [Radar] Tabla ARP procesada. Activos registrados en BD y caché listos.');
+    console.log('[RADAR] Tabla ARP procesada. Activos registrados en BD y caché listos.');
     await refreshCache();
   });
 };
 
 // Rutas API registradas...
-app.get('/api/network/context', (_req, res) => {
-  const context = getNetworkContext();
+app.get('/api/network/context', async (_req, res) => {
+  const context = await getNetworkContext();
   res.json(context);
 });
 
@@ -640,14 +921,26 @@ app.get('/api/events', (req, res) => {
 app.post('/api/radar/control', (req, res) => {
   const { active } = req.body;
   isRadarEnabled = Boolean(active);
-  console.log(isRadarEnabled ? '🚀 RADAR: ACTIVADO' : '🛑 RADAR: PAUSADO');
+  if (isRadarEnabled) {
+    console.log('\n========================================');
+    console.log('[RADAR] STATUS: ACTIVADO');
+    console.log('========================================\n');
+    // start runtime loops
+    startRadarRuntime();
+  } else {
+    console.log('\n========================================');
+    console.log('[RADAR] STATUS: PAUSADO');
+    console.log('========================================\n');
+    // stop intervals and any active sockets
+    stopRadarRuntime();
+  }
   res.json({ status: 'ok', radarActive: isRadarEnabled });
 });
 
 app.get('/api/assets', async (req, res) => {
   const networkId = normalizeNetworkId(String(req.query.networkId || ''));
   const dbAssets = await withDbCache(
-    () => (networkId ? Asset.find({ networkId }) : Asset.find()),
+    () => mergeAssetsFromDb(networkId || undefined),
     cachedAssets.filter((asset) => (networkId ? asset.networkId === networkId : true))
   );
   res.json(dbAssets);
@@ -655,24 +948,50 @@ app.get('/api/assets', async (req, res) => {
 
 app.post('/api/assets', async (req, res) => {
   try {
-    const rawNetworkId = String(req.body.networkId || getNetworkContext().activeNetworkId);
+    const rawNetworkId = String(req.body.networkId || (await getNetworkContext()).activeNetworkId);
     const networkId = normalizeNetworkId(rawNetworkId) || 'default';
     if (!isMongoReady()) {
       const asset = upsertCachedAsset({
         ...req.body,
         _id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
         networkId,
+        services: Array.isArray(req.body.services) ? req.body.services : [],
       });
       registerKnownMac(networkId, asset.mac || '');
       res.status(201).json(asset);
       return;
     }
 
-    const asset = new Asset({ ...req.body, networkId });
+    const asset = new Asset({
+      hostname: String(req.body.hostname || 'UNKNOWN'),
+      mac: String(req.body.mac || '00:00:00:00:00:00'),
+      os: String(req.body.os || 'Desconocido'),
+      vendor: String(req.body.vendor || 'Generico'),
+      criticality: Number(req.body.criticality || 5),
+      networkId,
+    });
+
     await asset.save();
+
+    await createScanSnapshot({
+      assetId: String(asset._id),
+      networkId,
+      ip: String(req.body.ip || ''),
+      detectionSource: (req.body.detectionSource || 'MANUAL') as 'ARP' | 'TTL' | 'MANUAL',
+      status: (req.body.status || 'Active') as 'Active' | 'Down' | 'Compromised',
+      mode: req.body.lastScanMode === 'stealth' ? 'stealth' : 'normal',
+    });
+
+    await replaceAssetServices({
+      assetId: String(asset._id),
+      networkId,
+      services: Array.isArray(req.body.services) ? req.body.services : [],
+    });
+
     registerKnownMac(networkId, asset.mac || '');
     await refreshCache();
-    res.status(201).json(asset);
+    const merged = cachedAssets.find((item) => String(item._id) === String(asset._id));
+    res.status(201).json(merged || asset);
   } catch (error) {
     console.error('❌ Error al crear asset:', error);
     res.status(400).json({ message: 'No fue posible crear el activo' });
@@ -686,7 +1005,7 @@ app.post('/api/assets/import', async (req, res) => {
     if (items.length === 0) return res.status(400).json({ message: 'Payload inválido' });
 
     const rawNetworkId = String(
-      req.query.networkId || getNetworkContext().activeNetworkId || 'default'
+      req.query.networkId || (await getNetworkContext()).activeNetworkId || 'default'
     );
     const networkId = normalizeNetworkId(rawNetworkId) || 'default';
 
@@ -697,6 +1016,7 @@ app.post('/api/assets/import', async (req, res) => {
           ...incoming,
           _id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
           networkId,
+          services: Array.isArray(incoming?.services) ? incoming.services : [],
         });
         registerKnownMac(networkId, asset.mac || '');
         saved.push(asset);
@@ -706,15 +1026,42 @@ app.post('/api/assets/import', async (req, res) => {
     }
 
     // Persistir en DB
-    const toInsert = items.map((i) => ({ ...i, networkId }));
-    const created = await Asset.insertMany(toInsert, { ordered: false }).catch((e) => {
-      // ignorar errores parciales
-      console.warn('Import parcial:', e?.message || e);
-      return [];
-    });
-    for (const a of created || []) registerKnownMac(networkId, a.mac || '');
+    let createdCount = 0;
+    for (const incoming of items) {
+      try {
+        const createdAsset = await Asset.create({
+          hostname: String(incoming?.hostname || 'UNKNOWN'),
+          mac: String(incoming?.mac || '00:00:00:00:00:00'),
+          os: String(incoming?.os || 'Desconocido'),
+          vendor: String(incoming?.vendor || 'Generico'),
+          criticality: Number(incoming?.criticality || 5),
+          networkId,
+        });
+
+        await createScanSnapshot({
+          assetId: String(createdAsset._id),
+          networkId,
+          ip: String(incoming?.ip || ''),
+          detectionSource: (incoming?.detectionSource || 'MANUAL') as 'ARP' | 'TTL' | 'MANUAL',
+          status: (incoming?.status || 'Active') as 'Active' | 'Down' | 'Compromised',
+          mode: incoming?.lastScanMode === 'stealth' ? 'stealth' : 'normal',
+        });
+
+        await replaceAssetServices({
+          assetId: String(createdAsset._id),
+          networkId,
+          services: Array.isArray(incoming?.services) ? incoming.services : [],
+        });
+
+        createdCount += 1;
+        registerKnownMac(networkId, createdAsset.mac || '');
+      } catch (e: any) {
+        console.warn('Import parcial:', e?.message || e);
+      }
+    }
+
     await refreshCache();
-    res.status(201).json({ created: (created || []).length });
+    res.status(201).json({ created: createdCount });
   } catch (error) {
     console.error('Error en import:', error);
     res.status(500).json({ message: 'Error interno al importar activos' });
@@ -730,7 +1077,13 @@ app.delete('/api/assets/:id', async (req, res) => {
       return;
     }
 
-    await Asset.findByIdAndDelete(req.params.id);
+    await withDbCache(async () => {
+      await Asset.findByIdAndDelete(req.params.id);
+      await Scan.deleteMany({ assetId: toObjectId(req.params.id) });
+      await Service.deleteMany({ assetId: toObjectId(req.params.id) });
+      return true;
+    }, false);
+
     await refreshCache();
     res.json({ message: 'Eliminado' });
   } catch (error) {
@@ -757,7 +1110,14 @@ app.delete('/api/workspaces/:id', async (req, res) => {
 
     // Borrar en la BD y luego limpiar caché
     await withDbCache(async () => {
+      const toDelete = await Asset.find({ networkId }).select('_id').lean();
+      const ids = toDelete.map((asset) => asset._id);
+
       await Asset.deleteMany({ networkId });
+      if (ids.length > 0) {
+        await Scan.deleteMany({ assetId: { $in: ids } });
+        await Service.deleteMany({ assetId: { $in: ids } });
+      }
       return true;
     }, false);
 
@@ -826,7 +1186,8 @@ app.post('/api/firewall/block', async (req, res) => {
 app.post('/api/feedback', async (req, res) => {
   try {
     const { email, message } = req.body ?? {};
-    if (!message || String(message).trim().length === 0) return res.status(400).json({ message: 'Mensaje requerido' });
+    if (!message || String(message).trim().length === 0)
+      return res.status(400).json({ message: 'Mensaje requerido' });
     const entry = pushFeedback({ email: String(email || ''), message: String(message) });
     res.status(201).json({ received: true, id: entry.id });
   } catch (e) {
@@ -843,12 +1204,43 @@ app.put('/api/assets/:id', async (req, res) => {
       return;
     }
 
-    const updated = await Asset.findByIdAndUpdate(req.params.id, req.body, {
-      new: true,
-    });
-    if (!updated) return res.status(404).json({ message: 'Activo no encontrado' });
+    const assetPatch: Record<string, unknown> = {};
+    const mutableAssetFields = ['hostname', 'mac', 'os', 'vendor', 'criticality', 'networkId'];
+    for (const field of mutableAssetFields) {
+      if (field in req.body) assetPatch[field] = req.body[field];
+    }
+
+    const existing = await Asset.findById(req.params.id);
+    if (!existing) return res.status(404).json({ message: 'Activo no encontrado' });
+
+    if (Object.keys(assetPatch).length > 0) {
+      await Asset.findByIdAndUpdate(req.params.id, assetPatch, { new: true });
+    }
+
+    const networkId = String((assetPatch.networkId as string) || existing.networkId || 'default');
+
+    if ('status' in req.body || 'ip' in req.body || 'detectionSource' in req.body || 'lastScanMode' in req.body) {
+      await updateLatestScanState({
+        assetId: req.params.id,
+        networkId,
+        status: (req.body.status || 'Active') as 'Active' | 'Down' | 'Compromised',
+        ip: req.body.ip ? String(req.body.ip) : undefined,
+        detectionSource: req.body.detectionSource as 'ARP' | 'TTL' | 'MANUAL' | undefined,
+        mode: req.body.lastScanMode as 'normal' | 'stealth' | undefined,
+      });
+    }
+
+    if (Array.isArray(req.body.services)) {
+      await replaceAssetServices({
+        assetId: req.params.id,
+        networkId,
+        services: req.body.services,
+      });
+    }
+
     await refreshCache();
-    res.json(updated);
+    const merged = cachedAssets.find((item) => String(item._id) === req.params.id);
+    res.json(merged || { _id: req.params.id, ...req.body });
   } catch (error) {
     console.error('❌ Error al actualizar:', error);
     res.status(500).json({ message: 'No fue posible actualizar el activo' });
@@ -871,31 +1263,46 @@ app.post('/api/scan', validateScanTarget, scanRateLimiter.middleware, async (req
   const mode = req.body.mode === 'stealth' ? 'stealth' : 'normal';
   const openServices: ServiceScan[] = [];
 
-  console.log(`🎯 [Scanner] Iniciando escaneo de puertos cruzando a -> ${ip} (Modo: ${mode})`);
+  console.log(`[SCANNER] Iniciando escaneo de puertos hacia -> ${ip} (Modo: ${mode})`);
 
   const scanPort = (port: number): Promise<void> => {
     return new Promise((resolve) => {
       const socket = new net.Socket();
+      activeScannerSockets.add(socket);
       socket.setTimeout(1100);
 
       socket.on('connect', async () => {
-        socket.destroy();
+        try {
+          socket.destroy();
+        } catch {}
+        activeScannerSockets.delete(socket);
         const banner = await getServiceBanner(ip, port);
         const fingerprint = [80, 443].includes(port)
           ? await getHttpFingerprint(ip, port)
           : 'Fingerprint no aplica';
-        console.log(`🔓 [Scanner] Puerto ${port} ABIERTO en ${ip}. Fingerprint: ${fingerprint}`);
+        console.log(`[SCANNER] Puerto ${port} ABIERTO en ${ip}. Fingerprint: ${fingerprint}`);
         openServices.push({ port, banner, fingerprint });
         resolve();
       });
 
-      socket.on('error', () => resolve());
+      socket.on('error', () => {
+        activeScannerSockets.delete(socket);
+        resolve();
+      });
       socket.on('timeout', () => {
-        socket.destroy();
+        try {
+          socket.destroy();
+        } catch {}
+        activeScannerSockets.delete(socket);
         resolve();
       });
 
-      socket.connect(port, ip);
+      try {
+        socket.connect(port, ip);
+      } catch (e) {
+        activeScannerSockets.delete(socket);
+        resolve();
+      }
     });
   };
 
@@ -930,17 +1337,24 @@ app.post('/api/scan', validateScanTarget, scanRateLimiter.middleware, async (req
     }
   } else {
     await withDbCache(async () => {
-      await Asset.findOneAndUpdate(
-        { ip },
-        {
-          $set: {
-            services: openServices,
-            lastScanAt: new Date(),
-            lastScanMode: mode,
-          },
-        },
-        { new: true }
-      );
+      const match = await Scan.findOne({ ip }).sort({ lastScanAt: -1, createdAt: -1 }).lean();
+      if (!match) return true;
+
+      await createScanSnapshot({
+        assetId: String(match.assetId),
+        networkId: match.networkId || 'default',
+        ip,
+        detectionSource: 'MANUAL',
+        status: 'Active',
+        mode,
+        scannedAt: new Date(),
+      });
+
+      await replaceAssetServices({
+        assetId: String(match.assetId),
+        networkId: match.networkId || 'default',
+        services: openServices,
+      });
       return true;
     }, false);
   }
@@ -958,29 +1372,44 @@ app.post('/api/scan', validateScanTarget, scanRateLimiter.middleware, async (req
 });
 
 const startRadarRuntime = () => {
+  // prevent double-start
+  if (radarIntervals.scan || radarIntervals.discover) return;
   void registerLocalHost();
   void autoDiscoverDevices();
-  setInterval(scanNetwork, 3 * 60 * 1000);
-  setInterval(autoDiscoverDevices, 20 * 1000);
+  radarIntervals.scan = setInterval(() => void scanNetwork(), 3 * 60 * 1000);
+  radarIntervals.discover = setInterval(() => void autoDiscoverDevices(), 20 * 1000);
+};
+
+const stopRadarRuntime = () => {
+  if (radarIntervals.scan) {
+    clearInterval(radarIntervals.scan);
+    delete radarIntervals.scan;
+  }
+  if (radarIntervals.discover) {
+    clearInterval(radarIntervals.discover);
+    delete radarIntervals.discover;
+  }
+  // kill any active sockets to stop in-flight scans/probes
+  destroyActiveSockets();
 };
 
 export const startServer = async (port = PORT) => {
   try {
     await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 5000 });
-    console.log('✅ Conectado a MongoDB Atlas');
+    console.log('[DB] Conectado a MongoDB Atlas');
   } catch (err) {
     console.error('❌ Error de conexión a MongoDB:', err);
-    console.log(`🚀 Iniciando de todas formas en modo Offline / Fallback en memoria.`);
+    console.log('[SERVER] Iniciando de todas formas en modo Offline / Fallback en memoria.');
   }
 
   await refreshCache();
   for (const asset of cachedAssets) registerKnownMac(asset.networkId || 'default', asset.mac || '');
 
-  console.log(`🚀 Radar H.A.D.A activo localmente. Autodescubrimiento iniciado...`);
+  console.log('[RADAR] Radar H.A.D.A activo localmente. Autodescubrimiento iniciado...');
   startRadarRuntime();
 
   return app.listen(port, () => {
-    console.log(`🚀 H.A.D.A. escuchando en http://localhost:${port}`);
+    console.log(`[SERVER] H.A.D.A. escuchando en http://localhost:${port}`);
   });
 };
 

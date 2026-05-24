@@ -1,4 +1,5 @@
 import type { Asset, PortScanResult, SecurityEvent } from '../types';
+import toast from 'react-hot-toast';
 import VulnerabilityBadge from './VulnerabilityBadge';
 import StatusBadge from './StatusBadge';
 import { formatDate, getDisplayProfile, getRiskScore } from '../utils/assetInsights';
@@ -58,13 +59,22 @@ export default function AssetModal({
               type="button"
               className="secondary-button small"
               onClick={async () => {
-                try {
-                  await fetch(`/api/assets/${encodeURIComponent(asset._id)}/isolate`, { method: 'POST' });
-                  // eslint-disable-next-line no-undef
-                  alert('Comando de aislamiento enviado');
-                } catch {
-                  alert('No se pudo enviar el comando de aislamiento');
-                }
+                const key = `isolate-${asset._id}`;
+                toast.promise(
+                  (async () => {
+                    const res = await fetch(`/api/assets/${encodeURIComponent(asset._id)}/isolate`, {
+                      method: 'POST',
+                    });
+                    if (!res.ok) throw new Error('failed');
+                    return res.json();
+                  })(),
+                  {
+                    loading: 'Enviando comando de aislamiento...',
+                    success: 'Comando de aislamiento enviado',
+                    error: 'No se pudo enviar el comando de aislamiento',
+                  },
+                  { id: key }
+                );
               }}
             >
               Aislar
@@ -73,16 +83,21 @@ export default function AssetModal({
               type="button"
               className="secondary-button small"
               onClick={async () => {
-                try {
-                  await fetch('/api/firewall/block', {
+                toast.promise(
+                  fetch('/api/firewall/block', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ ip: asset.ip }),
-                  });
-                  alert('IP enviada para bloqueo');
-                } catch {
-                  alert('No se pudo bloquear la IP');
-                }
+                  }).then((r) => {
+                    if (!r.ok) throw new Error('failed');
+                    return r.json();
+                  }),
+                  {
+                    loading: 'Solicitando bloqueo de IP...',
+                    success: 'IP enviada para bloqueo',
+                    error: 'No se pudo bloquear la IP',
+                  }
+                );
               }}
             >
               Bloquear IP

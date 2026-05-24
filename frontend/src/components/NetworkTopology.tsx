@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { forceCollide, forceLink, forceManyBody } from 'd3-force';
 import ForceGraph2D, {
   type ForceGraphMethods,
   type LinkObject,
@@ -42,8 +43,28 @@ export default function NetworkTopology({
   }, [hoveredNode]);
 
   useEffect(() => {
-    graphRef.current?.zoom(1, 0);
-    graphRef.current?.centerAt(0, 0, 0);
+    const graph = graphRef.current as
+      | (ForceGraphMethods<NodeObject<TopologyNode>, LinkObject<TopologyNode, TopologyLink>> & {
+          d3Force?: (forceName: string, forceValue?: unknown) => unknown;
+        })
+      | undefined;
+
+    if (!graph) return;
+
+    const charge = graph.d3Force?.('charge') as ReturnType<typeof forceManyBody> | null;
+    const link = graph.d3Force?.('link') as ReturnType<typeof forceLink> | null;
+    const collide = graph.d3Force?.('collide') as ReturnType<typeof forceCollide> | null;
+
+    charge?.strength(-400);
+    link?.distance(120);
+    collide?.radius(45);
+
+    if (!collide) {
+      graph.d3Force?.('collide', forceCollide(45));
+    }
+
+    graph.zoom(1, 0);
+    graph.centerAt(0, 0, 0);
   }, [nodes, links]);
 
   return (
@@ -73,6 +94,7 @@ export default function NetworkTopology({
           nodeCanvasObject={(node, ctx, globalScale) => {
             const graphNode = node as TopologyNode;
             const fontSize = Math.max(8, 12 / globalScale);
+            const label = graphNode.label || graphNode.id;
             const color =
               graphNode.type === 'router'
                 ? '#f59e0b'
@@ -81,24 +103,22 @@ export default function NetworkTopology({
                 : graphNode.status === 'Down'
                 ? '#94a3b8'
                 : '#34d399';
+            const radius = graphNode.type === 'router' ? 8 : 6;
 
             ctx.beginPath();
-            ctx.arc(
-              node.x ?? 0,
-              node.y ?? 0,
-              graphNode.type === 'router' ? 8 : 6,
-              0,
-              2 * Math.PI,
-              false
-            );
+            ctx.arc(node.x ?? 0, node.y ?? 0, radius, 0, 2 * Math.PI, false);
             ctx.fillStyle = color;
             ctx.fill();
+
+            ctx.strokeStyle = 'rgba(15,23,42,0.9)';
+            ctx.lineWidth = Math.max(1, 1 / globalScale);
+            ctx.stroke();
 
             ctx.font = `${fontSize}px Space Grotesk`;
             ctx.textAlign = 'center';
             ctx.textBaseline = 'top';
-            ctx.fillStyle = '#cbd5e1';
-            ctx.fillText(graphNode.label, node.x ?? 0, (node.y ?? 0) + 8);
+            ctx.fillStyle = '#e2e8f0';
+            ctx.fillText(label, node.x ?? 0, (node.y ?? 0) + 14);
           }}
         />
       </div>

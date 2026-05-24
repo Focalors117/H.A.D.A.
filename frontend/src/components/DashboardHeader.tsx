@@ -46,18 +46,20 @@ export default function DashboardHeader({
   onOpenImport?: () => void;
   onOpenFeedback?: () => void;
 }) {
-  // include onOpenImport in destructuring
-  // (added explicitly to keep prop list clear)
   return (
     <>
       <header className="hada-header">
-        <div className="space-y-1">
-          <p className="hada-kicker">Interfaz de operaciones</p>
-          <h1 className="hada-title" data-text="H.A.D.A">
-            H.A.D.A
-          </h1>
-          <p className="text-sm text-slate-300/80 sm:text-base">
-            Hub de Análisis y Defensa Avanzada
+        <div className="hada-brand">
+          <div className="space-y-1">
+            <p className="hada-kicker">Interfaz de operaciones</p>
+            <h1 className="hada-title" data-text="H.A.D.A">
+              H.A.D.A
+            </h1>
+            <p className="hada-subtitle">Hub de Análisis y Defensa Avanzada</p>
+          </div>
+          <p className="hada-brand-note">
+            Radar, telemetría y controles secundarios se agrupan en un solo panel para que la
+            cabecera respire mejor.
           </p>
         </div>
 
@@ -94,71 +96,83 @@ export default function DashboardHeader({
             </div>
           </div>
 
-          <div className="control-chip">
-            <span className="control-label">Radar</span>
-            <button
-              type="button"
-              className={`control-button ${radarActive ? 'is-on' : 'is-off'}`}
-              onClick={onToggleRadar}
-            >
-              {radarActive ? 'ACTIVO' : 'PAUSADO'}
-            </button>
-          </div>
+          <details className="operations-drawer">
+            <summary className="operations-summary">
+              <span>Controles rápidos</span>
+              <span className="operations-summary-badge">Abrir</span>
+            </summary>
+            <div className="operations-panel">
+              <div className="operations-grid">
+                <div className="control-chip">
+                  <span className="control-label">Radar</span>
+                  <button
+                    type="button"
+                    className={`control-button ${radarActive ? 'is-on' : 'is-off'}`}
+                    onClick={onToggleRadar}
+                  >
+                    {radarActive ? 'ACTIVO' : 'PAUSADO'}
+                  </button>
+                </div>
 
-          <label className="control-chip">
-            <span className="control-label">TTL</span>
-            <input
-              type="number"
-              min={1}
-              max={120}
-              value={ttlSeconds}
-              onChange={(event) => onTtlChange(Number(event.target.value) || 10)}
-              className="control-input"
-            />
-          </label>
+                <label className="control-chip">
+                  <span className="control-label">TTL</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={120}
+                    value={ttlSeconds}
+                    onChange={(event) => onTtlChange(Number(event.target.value) || 10)}
+                    className="control-input"
+                  />
+                </label>
 
-          <div className="control-chip">
-            <span className="control-label">Telemetría</span>
-            <button
-              type="button"
-              className={`control-button ${telemetryEnabled ? 'is-on' : 'is-off'}`}
-              onClick={() => onToggleTelemetry?.()}
-            >
-              {telemetryEnabled ? 'ACTIVADA' : 'DESACTIVADA'}
-            </button>
-          </div>
+                <div className="control-chip">
+                  <span className="control-label">Telemetría</span>
+                  <button
+                    type="button"
+                    className={`control-button ${telemetryEnabled ? 'is-on' : 'is-off'}`}
+                    onClick={() => onToggleTelemetry?.()}
+                  >
+                    {telemetryEnabled ? 'ACTIVADA' : 'DESACTIVADA'}
+                  </button>
+                </div>
 
-          <div className="control-chip">
-            <span className="control-label">Animaciones</span>
-            <button
-              type="button"
-              className={`control-button ${animationsEnabled ? 'is-on' : 'is-off'}`}
-              onClick={() => onToggleAnimations?.()}
-            >
-              {animationsEnabled ? 'ACTIVAS' : 'INACTIVAS'}
-            </button>
-          </div>
+                <div className="control-chip">
+                  <span className="control-label">Animaciones</span>
+                  <button
+                    type="button"
+                    className={`control-button ${animationsEnabled ? 'is-on' : 'is-off'}`}
+                    onClick={() => onToggleAnimations?.()}
+                  >
+                    {animationsEnabled ? 'ACTIVAS' : 'INACTIVAS'}
+                  </button>
+                </div>
 
-          <div className="control-chip">
-            <span className="control-label">Paneo</span>
-            <button
-              type="button"
-              className={`control-button ${panLocked ? 'is-off' : 'is-on'}`}
-              onClick={() => onTogglePanLock?.()}
-            >
-              {panLocked ? 'BLOQUEADO' : 'LIBRE'}
-            </button>
-          </div>
+                <div className="control-chip">
+                  <span className="control-label">Paneo</span>
+                  <button
+                    type="button"
+                    className={`control-button ${panLocked ? 'is-off' : 'is-on'}`}
+                    onClick={() => onTogglePanLock?.()}
+                  >
+                    {panLocked ? 'BLOQUEADO' : 'LIBRE'}
+                  </button>
+                </div>
+              </div>
 
-          <button type="button" className="ghost-button" onClick={onRefresh}>
-            Refrescar
-          </button>
-          <button type="button" className="ghost-button" onClick={() => onOpenImport?.()}>
-            Importar
-          </button>
-          <button type="button" className="ghost-button" onClick={() => onOpenFeedback?.()}>
-            Feedback
-          </button>
+              <div className="operations-actions">
+                <button type="button" className="ghost-button" onClick={onRefresh}>
+                  Refrescar
+                </button>
+                <button type="button" className="ghost-button" onClick={() => onOpenImport?.()}>
+                  Importar
+                </button>
+                <button type="button" className="ghost-button" onClick={() => onOpenFeedback?.()}>
+                  Feedback
+                </button>
+              </div>
+            </div>
+          </details>
         </div>
       </header>
 
